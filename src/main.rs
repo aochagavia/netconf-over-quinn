@@ -3,27 +3,21 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::fs;
 
 mod client;
+mod io;
 mod server;
-mod netconf;
+mod ssh_client;
+mod ssh_listener;
 
-static ALPN_STRING: &str = "NoQ";
+static NETCONF_ALPN_STRING: &str = "NoQ";
 static SERVER_CERT_PATH: &str = "certificates/server_cert.der";
 static SERVER_KEY_PATH: &str = "certificates/server_key.der";
+static CLIENT_SSH_PRIVATE_KEY_PATH: &str = "ssh_keys/client_rsa";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or("server".to_string());
 
     // TODO: make configurable
     let socket_addr = "127.0.0.1:8080".parse().context("invalid socket address")?;
-
-    // TODO: disable idle timeout
-    // TODO: gracefully handle netconf's close session request
-    // TODO: handle netconf's kill session request
-
-    //  TODO: not sure about the meaning of the next 3 lines.
-    //  When a NETCONF entity is detecting the interruption of the QUIC
-    //  connection, it SHOULD send a <close-session> request to the peer
-    //  NETCONF entity.
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

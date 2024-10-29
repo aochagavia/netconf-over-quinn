@@ -1,11 +1,12 @@
-use crate::{netconf, ALPN_STRING, SERVER_CERT_PATH, SERVER_KEY_PATH};
-use anyhow::{anyhow, Context};
+use crate::io::{netconf, proxy};
+use crate::{ssh_client, NETCONF_ALPN_STRING, SERVER_CERT_PATH, SERVER_KEY_PATH};
+use anyhow::{anyhow, bail, Context};
 use quinn::crypto::rustls::QuicServerConfig;
+use quinn::Incoming;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use quinn::Incoming;
 
 pub async fn run_server(socket_addr: SocketAddr) -> anyhow::Result<()> {
     let server_cert = fs::read(SERVER_CERT_PATH).context("failed to read server cert")?;
@@ -18,9 +19,7 @@ pub async fn run_server(socket_addr: SocketAddr) -> anyhow::Result<()> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![server_cert], server_key)?;
-    server_crypto.alpn_protocols = vec![ALPN_STRING.as_bytes().to_vec()];
-
-    // server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
+    server_crypto.alpn_protocols = vec![NETCONF_ALPN_STRING.as_bytes().to_vec()];
 
     let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
@@ -29,7 +28,12 @@ pub async fn run_server(socket_addr: SocketAddr) -> anyhow::Result<()> {
     println!("listening on {}", endpoint.local_addr()?);
 
     while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(session(incoming));
+        tokio::spawn(async move {
+            match session(incoming).await {
+                Ok(_) => {}
+                Err(e) => println!("error: {e:?}"),
+            }
+        });
     }
 
     endpoint.wait_idle().await;
@@ -41,25 +45,89 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
         .await
         .context("failed to initialize incoming connection")?;
 
-    // Hello
-    let (mut hello_tx, mut hello_rx) = conn.accept_bi().await?;
-    hello_tx.write_all(netconf::hello().as_bytes()).await?;
-    hello_tx.finish()?;
+    let mut channel = ssh_client::with_default_ssh_keys("127.0.0.1:830").await?;
 
-    let client_hello = hello_rx.read_to_end(usize::MAX).await?;
+    // Receive client hello message
+    let mut hello_stream = conn.accept_uni().await?;
+    let hello = proxy::read_message(&mut hello_stream).await?;
+    if !hello.payload.starts_with(b"<hello") {
+        bail!("Expected hello message, found something else");
+    }
+    let mut ssh_writer = channel.make_writer();
+    netconf::write_message(&mut ssh_writer, hello).await?;
 
-    // TODO: netconf mandates utf-8; we should return a proper error if we receive invalid utf-8
-    println!("{}", String::from_utf8(client_hello)?);
+    println!("=== HELLO RECEIVED");
 
-    // TODO: handle incoming messages
-    // - <close-session> (see https://support.huawei.com/enterprise/en/doc/EDOC1100271790/9d14e7e4/closing-the-netconf-session)
-    // - <kill-session>
-    // - <create-subscription>
-    // Other possible messages
+    // We handle the SSH client's received messages in a separate task, because we need to
+    // always be listening (in case we are receiving a notification instead of a normal response)
+    let (ssh_response_tx, mut ssh_response_rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn_clone = conn.clone();
+    tokio::spawn(async move {
+        while let Some(message) = netconf::read_message(&mut channel.make_reader()).await? {
+            if message.payload.starts_with(b"<rpc-reply") {
+                ssh_response_tx
+                    .send(message)
+                    .context("failed to send SSH response")?;
+            } else {
+                let mut stream = conn_clone.open_uni().await?;
 
-    conn.closed().await;
+                println!("=== NOTIFICATION");
+                println!("{}", String::from_utf8_lossy(&message.payload));
 
-    Ok(())
+                proxy::write_message(&mut stream, message).await?;
+
+                // Close the stream
+                stream.finish()?;
+
+                // TODO: I had to add this to ensure the stream actually got sent... Can we remove it?
+                stream.stopped().await?;
+
+                println!("=== SENT");
+            }
+        }
+
+        println!("=== NOTIFICATION TASK DONE");
+        Ok::<(), anyhow::Error>(())
+    });
+
+    loop {
+        // Each request-response is handled inside a new bidi stream
+        let (mut response_tx, mut request_rx) = conn.accept_bi().await.context("failed to accept bidi stream")?;
+
+        println!("=== ACCEPTED BIDI STREAM");
+
+        let request = proxy::read_message(&mut request_rx).await?;
+        if !request.payload.starts_with(b"<rpc") {
+            bail!(
+                "unknown message type: {}",
+                String::from_utf8_lossy(&request.payload)
+            );
+        }
+
+        println!(
+            "=== RECEIVED MESSAGE (terminator = {:?})",
+            request.framing_method
+        );
+
+        netconf::write_message(&mut ssh_writer, request).await.context("failed to write to NETCONF server")?;
+
+        println!("=== WROTE MESSAGE TO REAL SERVER");
+        let response = ssh_response_rx
+            .recv()
+            .await
+            .ok_or(anyhow!("no SSH response!"))?;
+
+        println!("=== SERVER RESPONSE READ");
+        proxy::write_message(&mut response_tx, response).await?;
+
+        // Close the stream
+        response_tx.finish()?;
+
+        println!("=== PROXIED RESPONSE TO CLIENT");
+    }
+
+    // conn.closed().await;
+    // println!("=== CLOSED SESSION");
+    //
+    // Ok(())
 }
-
-
