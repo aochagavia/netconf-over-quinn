@@ -1,4 +1,4 @@
-use crate::io::{netconf, proxy};
+use crate::io::{netconf_quic, netconf_ssh};
 use crate::{ssh_client, NETCONF_ALPN_STRING, SERVER_CERT_PATH, SERVER_KEY_PATH};
 use anyhow::{anyhow, bail, Context};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -49,12 +49,12 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
 
     // Receive client hello message
     let mut hello_stream = conn.accept_uni().await?;
-    let hello = proxy::read_message(&mut hello_stream).await?;
+    let hello = netconf_quic::read_message(&mut hello_stream).await?;
     if !hello.payload.starts_with(b"<hello") {
         bail!("Expected hello message, found something else");
     }
     let mut ssh_writer = channel.make_writer();
-    netconf::write_message(&mut ssh_writer, hello).await?;
+    netconf_ssh::write_message(&mut ssh_writer, hello).await?;
 
     println!("=== HELLO RECEIVED");
 
@@ -63,7 +63,7 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
     let (ssh_response_tx, mut ssh_response_rx) = tokio::sync::mpsc::unbounded_channel();
     let conn_clone = conn.clone();
     tokio::spawn(async move {
-        while let Some(message) = netconf::read_message(&mut channel.make_reader()).await? {
+        while let Some(message) = netconf_ssh::read_message(&mut channel.make_reader()).await? {
             if message.payload.starts_with(b"<rpc-reply") {
                 ssh_response_tx
                     .send(message)
@@ -74,7 +74,7 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
                 println!("=== NOTIFICATION");
                 println!("{}", String::from_utf8_lossy(&message.payload));
 
-                proxy::write_message(&mut stream, message).await?;
+                netconf_quic::write_message(&mut stream, message).await?;
 
                 // Close the stream
                 stream.finish()?;
@@ -92,11 +92,14 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
 
     loop {
         // Each request-response is handled inside a new bidi stream
-        let (mut response_tx, mut request_rx) = conn.accept_bi().await.context("failed to accept bidi stream")?;
+        let (mut response_tx, mut request_rx) = conn
+            .accept_bi()
+            .await
+            .context("failed to accept bidi stream")?;
 
         println!("=== ACCEPTED BIDI STREAM");
 
-        let request = proxy::read_message(&mut request_rx).await?;
+        let request = netconf_quic::read_message(&mut request_rx).await?;
         if !request.payload.starts_with(b"<rpc") {
             bail!(
                 "unknown message type: {}",
@@ -104,12 +107,11 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
             );
         }
 
-        println!(
-            "=== RECEIVED MESSAGE (terminator = {:?})",
-            request.framing_method
-        );
+        println!("=== RECEIVED MESSAGE",);
 
-        netconf::write_message(&mut ssh_writer, request).await.context("failed to write to NETCONF server")?;
+        netconf_ssh::write_message(&mut ssh_writer, request)
+            .await
+            .context("failed to write to NETCONF server")?;
 
         println!("=== WROTE MESSAGE TO REAL SERVER");
         let response = ssh_response_rx
@@ -118,7 +120,7 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
             .ok_or(anyhow!("no SSH response!"))?;
 
         println!("=== SERVER RESPONSE READ");
-        proxy::write_message(&mut response_tx, response).await?;
+        netconf_quic::write_message(&mut response_tx, response).await?;
 
         // Close the stream
         response_tx.finish()?;

@@ -1,4 +1,4 @@
-use crate::io::{netconf, proxy};
+use crate::io::{netconf_quic, netconf_ssh};
 use crate::ssh_listener::NetconfSshListener;
 use crate::{NETCONF_ALPN_STRING, SERVER_CERT_PATH};
 use anyhow::{bail, Context};
@@ -44,7 +44,8 @@ pub async fn run_client(socket_addr: SocketAddr) -> anyhow::Result<()> {
 
         let mut hello_sent = false;
         loop {
-            let Some(request) = netconf::read_message(&mut ssh_connection.make_reader()).await?
+            let Some(request) =
+                netconf_ssh::read_message(&mut ssh_connection.make_reader()).await?
             else {
                 break;
             };
@@ -58,28 +59,28 @@ pub async fn run_client(socket_addr: SocketAddr) -> anyhow::Result<()> {
 
                 hello_sent = true;
 
-                println!("=== SENDING HELLO (framing = {:?})", request.framing_method);
+                println!("=== SENDING HELLO");
                 println!("{}", String::from_utf8_lossy(&request.payload));
                 let mut stream = connection_clone.open_uni().await?;
-                proxy::write_message(&mut stream, request).await?;
+                netconf_quic::write_message(&mut stream, request).await?;
                 stream.finish()?;
             } else if request.payload.starts_with(b"<rpc") {
                 // Each RPC call is processed inside its own bidi stream
                 let (mut request_tx, mut response_rx) = connection_clone.open_bi().await?;
 
-                println!("=== REQUEST (framing = {:?})", request.framing_method);
+                println!("=== REQUEST");
                 println!("{}", String::from_utf8_lossy(&request.payload));
 
-                proxy::write_message(&mut request_tx, request).await?;
+                netconf_quic::write_message(&mut request_tx, request).await?;
                 request_tx.finish()?;
 
-                let response = proxy::read_message(&mut response_rx).await?;
+                let response = netconf_quic::read_message(&mut response_rx).await?;
 
-                println!("=== RESPONSE (framing = {:?})", response.framing_method);
+                println!("=== RESPONSE");
                 println!("{}", String::from_utf8_lossy(&response.payload));
 
                 // Write response to the SSH writer
-                netconf::write_message(&mut ssh_connection.make_writer(), response).await?;
+                netconf_ssh::write_message(&mut ssh_connection.make_writer(), response).await?;
             } else {
                 println!("=== UNKNOWN MESSAGE KIND");
                 println!("{}", String::from_utf8_lossy(&request.payload));
@@ -96,12 +97,12 @@ pub async fn run_client(socket_addr: SocketAddr) -> anyhow::Result<()> {
     println!("=== HANDLING NOTIFICATIONS");
     while let Ok(mut notification_rx) = connection.accept_uni().await {
         println!("=== ACCEPTED UNI STREAM");
-        let message = proxy::read_message(&mut notification_rx).await?;
+        let message = netconf_quic::read_message(&mut notification_rx).await?;
 
-        println!("=== NOTIFICATION (framing = {:?})", message.framing_method);
+        println!("=== NOTIFICATION");
         println!("{}", String::from_utf8_lossy(&message.payload));
 
-        netconf::write_message(&mut ssh_writer, message).await?;
+        netconf_ssh::write_message(&mut ssh_writer, message).await?;
 
         println!("=== WRITTEN");
     }

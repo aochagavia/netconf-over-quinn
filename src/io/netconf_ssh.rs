@@ -4,29 +4,22 @@ use anyhow::{bail, Context};
 use std::iter;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[derive(PartialEq, Eq, Debug)]
-pub enum FramingMethod {
-    Terminated = 0,
-    Chunked = 1,
-}
-
 pub async fn write_message(
     channel: &mut (impl AsyncWrite + Unpin),
     message: ProxiedMessage,
 ) -> anyhow::Result<()> {
     let mut payload;
 
-    match message.framing_method {
-        FramingMethod::Terminated => {
-            payload = message.payload;
-            payload.extend_from_slice(b"]]>]]>");
-        }
-        FramingMethod::Chunked => {
-            payload = format!("\n#{}\n", message.payload.len()).into_bytes();
-            payload.extend_from_slice(&message.payload);
-            payload.extend_from_slice(b"\n##\n");
-        }
-    }
+    if message.payload.starts_with(b"<hello") {
+        // Terminated
+        payload = message.payload;
+        payload.extend_from_slice(b"]]>]]>");
+    } else {
+        // Chunked
+        payload = format!("\n#{}\n", message.payload.len()).into_bytes();
+        payload.extend_from_slice(&message.payload);
+        payload.extend_from_slice(b"\n##\n");
+    };
 
     channel.write_all(&payload).await?;
 
@@ -35,7 +28,6 @@ pub async fn write_message(
 
 pub struct ProxiedMessage {
     pub payload: Vec<u8>,
-    pub framing_method: FramingMethod,
 }
 
 pub async fn read_message(
@@ -95,10 +87,7 @@ async fn read_terminated(channel: &mut (impl AsyncRead + Unpin)) -> anyhow::Resu
         result.push(channel.read_u8().await?);
         if result.ends_with(b"]]>]]>") {
             result.truncate(result.len() - b"]]>]]>".len());
-            return Ok(ProxiedMessage {
-                payload: result,
-                framing_method: FramingMethod::Terminated,
-            });
+            return Ok(ProxiedMessage { payload: result });
         }
     }
 }
@@ -132,10 +121,7 @@ async fn read_chunked(
         let mut byte = channel.read_u8().await?;
         if byte == b'#' {
             eat(channel, b'\n').await?;
-            return Ok(ProxiedMessage {
-                payload: result,
-                framing_method: FramingMethod::Chunked,
-            });
+            return Ok(ProxiedMessage { payload: result });
         }
 
         // We got another chunk!
@@ -171,7 +157,7 @@ async fn eat(reader: &mut (impl AsyncRead + Unpin), expected: u8) -> anyhow::Res
 
 #[cfg(test)]
 mod test {
-    use crate::io::netconf::{read_message, FramingMethod};
+    use super::*;
 
     #[tokio::test]
     pub async fn test_read_terminated() -> anyhow::Result<()> {
@@ -183,8 +169,6 @@ mod test {
         let output = read_message(&mut body.as_bytes()).await?;
 
         let output = output.unwrap();
-        assert_eq!(output.framing_method, FramingMethod::Terminated);
-
         let output = String::from_utf8(output.payload)?;
         assert_eq!(output.as_str(), expected_output);
 
@@ -205,8 +189,6 @@ mod test {
         let output = read_message(&mut body.as_bytes()).await?;
 
         let output = output.unwrap();
-        assert_eq!(output.framing_method, FramingMethod::Chunked);
-
         let output = String::from_utf8(output.payload)?;
         assert_eq!(output.as_str(), expected_output);
 
@@ -232,8 +214,6 @@ mod test {
         let output = read_message(&mut body.as_bytes()).await?;
 
         let output = output.unwrap();
-        assert_eq!(output.framing_method, FramingMethod::Chunked);
-
         let output = String::from_utf8(output.payload)?;
         assert_eq!(output.as_str(), expected_output);
 
