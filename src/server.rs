@@ -2,7 +2,7 @@ use crate::io::{netconf_quic, netconf_ssh};
 use crate::{ssh_client, NETCONF_ALPN_STRING, SERVER_CERT_PATH, SERVER_KEY_PATH};
 use anyhow::{anyhow, bail, Context};
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::Incoming;
+use quinn::{Incoming, SendStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
 use std::net::SocketAddr;
@@ -48,15 +48,17 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
     let mut channel = ssh_client::with_default_ssh_keys("127.0.0.1:830").await?;
 
     // Receive client hello message
-    let mut hello_stream = conn.accept_uni().await?;
-    let hello = netconf_quic::read_message(&mut hello_stream).await?;
+    let (hello_stream_tx, mut hello_stream_rx) = conn.accept_bi().await?;
+    let hello = netconf_quic::read_message(&mut hello_stream_rx).await?;
     if !hello.payload.starts_with(b"<hello") {
         bail!("Expected hello message, found something else");
     }
     let mut ssh_writer = channel.make_writer();
     netconf_ssh::write_message(&mut ssh_writer, hello).await?;
-
     println!("=== HELLO RECEIVED");
+
+    let mut hello_stream_tx = Some(hello_stream_tx);
+    let mut notifications_tx: Option<SendStream> = None;
 
     // We handle the SSH client's received messages in a separate task, because we need to
     // always be listening (in case we are receiving a notification instead of a normal response)
@@ -65,24 +67,39 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
     tokio::spawn(async move {
         while let Some(message) = netconf_ssh::read_message(&mut channel.make_reader()).await? {
             if message.payload.starts_with(b"<rpc-reply") {
+                println!("=== RPC REPLY");
                 ssh_response_tx
                     .send(message)
                     .context("failed to send SSH response")?;
-            } else {
-                let mut stream = conn_clone.open_uni().await?;
+            } else if message.payload.starts_with(b"<notification") {
+                let mut tx = match notifications_tx {
+                    Some(tx) => tx,
+                    None => {
+                        println!("=== CREATING NOTIFICATION STREAM");
+                        conn_clone.open_uni().await?
+                    }
+                };
 
                 println!("=== NOTIFICATION");
                 println!("{}", String::from_utf8_lossy(&message.payload));
 
-                netconf_quic::write_message(&mut stream, message).await?;
-
-                // Close the stream
-                stream.finish()?;
-
-                // TODO: I had to add this to ensure the stream actually got sent... Can we remove it?
-                stream.stopped().await?;
+                netconf_ssh::write_message(&mut tx, message).await?;
+                notifications_tx = Some(tx);
 
                 println!("=== SENT");
+            } else if message.payload.starts_with(b"<hello") {
+                let Some(mut hello_stream_tx) = hello_stream_tx.take() else {
+                    bail!("hello message sent for a second time");
+                };
+
+                netconf_quic::write_message(&mut hello_stream_tx, message).await?;
+                hello_stream_tx.finish()?;
+                println!("=== SENT HELLO")
+            } else {
+                bail!(
+                    "server tried to send message of unknown kind: {}",
+                    String::from_utf8_lossy(&message.payload)
+                );
             }
         }
 
@@ -91,6 +108,8 @@ async fn session(incoming: Incoming) -> anyhow::Result<()> {
     });
 
     loop {
+        println!("=== ACCEPT BI");
+
         // Each request-response is handled inside a new bidi stream
         let (mut response_tx, mut request_rx) = conn
             .accept_bi()

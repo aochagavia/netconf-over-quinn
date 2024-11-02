@@ -1,4 +1,4 @@
-use crate::CLIENT_SSH_PRIVATE_KEY_PATH;
+use crate::PROXY_SERVER_SSH_PRIVATE_KEY_PATH;
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use russh::client::Msg;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::net::ToSocketAddrs;
 
 pub async fn with_default_ssh_keys(addr: impl ToSocketAddrs) -> anyhow::Result<Channel<Msg>> {
-    let key_pair = russh_keys::load_secret_key(CLIENT_SSH_PRIVATE_KEY_PATH, None)?;
+    let key_pair = russh_keys::load_secret_key(PROXY_SERVER_SSH_PRIVATE_KEY_PATH, None)?;
     let config = russh::client::Config {
         ..Default::default()
     };

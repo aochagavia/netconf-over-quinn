@@ -11,7 +11,8 @@ mod ssh_listener;
 static NETCONF_ALPN_STRING: &str = "NoQ";
 static SERVER_CERT_PATH: &str = "certificates/server_cert.der";
 static SERVER_KEY_PATH: &str = "certificates/server_key.der";
-static CLIENT_SSH_PRIVATE_KEY_PATH: &str = "ssh_keys/client_rsa";
+static PROXY_SERVER_SSH_PRIVATE_KEY_PATH: &str = "ssh_keys/proxy_server_rsa";
+static PROXY_CLIENT_SSH_PRIVATE_KEY_PATH: &str = "ssh_keys/proxy_client_rsa";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or("server".to_string());

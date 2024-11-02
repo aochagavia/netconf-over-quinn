@@ -1,6 +1,7 @@
+use crate::PROXY_CLIENT_SSH_PRIVATE_KEY_PATH;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use russh::keys::key::{KeyPair, PublicKey, RsaPrivate, SignatureHash};
+use russh::keys::key::PublicKey;
 use russh::server::{Auth, Config, Msg, Session};
 use russh::{Channel, ChannelId};
 use std::net::SocketAddr;
@@ -10,12 +11,23 @@ use tokio::net::TcpListener;
 /// Accepts NETCONF connections from a SSH client and handles messages
 pub struct NetconfSshListener {
     listener: TcpListener,
+    ssh_config: Arc<Config>,
 }
 
 impl NetconfSshListener {
     pub async fn new(addr: SocketAddr) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        Ok(Self { listener })
+        let ssh_config = Arc::new(Config {
+            keys: vec![russh_keys::load_secret_key(
+                PROXY_CLIENT_SSH_PRIVATE_KEY_PATH,
+                None,
+            )?],
+            ..Config::default()
+        });
+        Ok(Self {
+            listener,
+            ssh_config,
+        })
     }
 
     pub async fn next_client(&self) -> anyhow::Result<Channel<Msg>> {
@@ -23,13 +35,7 @@ impl NetconfSshListener {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         russh::server::run_stream(
-            Arc::new(Config {
-                keys: vec![KeyPair::RSA {
-                    key: RsaPrivate::generate(2048).unwrap(),
-                    hash: SignatureHash::SHA2_256,
-                }],
-                ..Config::default()
-            }),
+            self.ssh_config.clone(),
             stream,
             SshSession {
                 channel: None,
@@ -38,8 +44,8 @@ impl NetconfSshListener {
         )
         .await?;
 
-        // TODO: this await means that no new connections are established if the client keeps the
-        // connection open without initializing the netconf subsystem
+        // We receive an event through the channel once a client has connected and initialized the
+        // netconf subsystem
         Ok(rx.await?)
     }
 }
